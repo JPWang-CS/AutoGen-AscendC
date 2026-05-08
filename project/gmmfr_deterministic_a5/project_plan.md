@@ -1,7 +1,8 @@
 # GMMFR 确定性特性 A5 迁移项目计划
 
-> 更新日期：2026-05-07
-> 版本：v3.0（范围缩减：仅 W8A8/INT8 确定性，修正 A5 数据类型映射，双人分工）
+> 更新日期：2026-05-08
+> 版本：v3.1（代码已修改，范围仅 W8A8/INT8 确定性，5文件已同步到源码）
+> 状态：**代码修改完成** — 待编译验证和端到端测试
 
 ## 一、项目概述
 
@@ -282,3 +283,17 @@ P2 (人员B) ─────────────────────→ 
 4. [ ] **仅 W8A8/INT8 PerToken 路径**支持确定性，FP8/HIFLOAT8/MX/WeightQuant 不受影响
 5. [ ] 非确定性模式零回归（与改动前结果完全一致）
 6. [ ] A2/A3/A5 三平台 CI 全部通过
+
+## 九、代码修改状态（v3.1 更新）
+
+> 以下文件已修改并同步到 `ops-transformer_AI` 源码仓库
+
+| # | 文件 | 操作 | 同步状态 |
+|---|---|---|---|
+| 1 | `op_kernel/arch35/grouped_matmul_finalize_routing_tiling_data.h` | 修改：reserved2 → 确定性字段 | **已完成** |
+| 2 | `op_host/op_tiling/arch35/grouped_matmul_finalize_routing_quant_tiling.h` | 修改：声明确定性成员 | **已完成** |
+| 3 | `op_host/op_tiling/arch35/grouped_matmul_finalize_routing_quant_tiling.cpp` | 修改：DoOpTiling + PrintQuantParams | **已完成** |
+| 4 | `op_kernel/arch35/gmm_fr_deterministic_a5.h` | **新增**：A5 确定性聚合函数 | **已完成** |
+| 5 | `op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h` | 修改：if/else 确定性分支 | **已完成** |
+
+详细修改明细见：`code_modification_detail.md`

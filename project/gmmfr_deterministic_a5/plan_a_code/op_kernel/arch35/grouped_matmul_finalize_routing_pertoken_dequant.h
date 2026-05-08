@@ -1,30 +1,30 @@
 /**
- * 修改文件 9: op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h
- *
- * 修改原因: 全量化路径 (K-C/T-C) 的 Cgmct Kernel。
- *           方案A：不修改 Epilogue，通过 Params 重定向 y 地址到 workspace，
- *           然后在 Cgmct Kernel 完成后调用 FRDeterministicA5 聚合到真实 yGm。
- *
- * A3 原型:
- *   - Init 第162-166行: mmQuantOutGm 指向 workspace 偏移
- *   - InitUbBuffer 第186-188行: queBind 分配 DETER_UB_SIZE
- *   - Process 第303-306行: SyncConfig 初始化
- *   - Process 第331-334行: 最终 FRDeterministic 调用
- *
- * 修改内容:
- *   1. 读取 deterministicFlag
- *   2. 确定性模式下：Params 中 y → workspace 偏移，Kernel 完成后调用 FRDeterministicA5
- *   3. 非确定性模式下：完全不变
- *
- * 注意：以下为 diff 模式，仅展示新增/修改部分，其余代码保持原样
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file grouped_matmul_finalize_routing_pertoken_dequant.h
+ * \brief
  */
 
-// === 在文件开头添加 include ===
-// <<< ADD BEGIN
+#ifndef GROUPED_MATMUL_FINALIZE_ROUTING_PERTOKEN_DEQUANT_H
+#define GROUPED_MATMUL_FINALIZE_ROUTING_PERTOKEN_DEQUANT_H
+
+#include "cgmct/kernel/kernel_gmm_finalize_routing_pertoken_dequant.h"
+#include "cgmct/block/block_mmad_builder.h"
+#include "cgmct/block/block_scheduler_gmm_aswt_with_tail_split.h"
+#include "grouped_matmul_finalize_routing_tiling_data.h"
 #include "gmm_fr_deterministic_a5.h"
 using namespace GMMFRDeterministic;
-// <<< ADD END
 
+using namespace Cgmct::Gemm;
+using namespace Cgmct::Gemm::Kernel;
 
 template <typename layoutA, typename layoutB, int scaleType, int rowIndType>
 __aicore__ inline void grouped_matmul_finalize_routing_pertoken_dequant(
@@ -46,10 +46,11 @@ __aicore__ inline void grouped_matmul_finalize_routing_pertoken_dequant(
     using LayoutA = layoutA;
     using LayoutB = layoutB;
     using LayoutC = layout::RowMajorAlign;
+    // 2 represents bf16 dtype
     using weightscaleType = std::conditional_t<scaleType == 2, bfloat16_t, float>;
     using BiasType = bfloat16_t;
     using LayoutBias = layout::RowMajor;
-    using C1Type = std::conditional_t<std::is_same_v<AType, int8_t>, int32_t, float>;
+    using C1Type = std::conditional_t<std::is_same_v<AType, int8_t>, int32_t, float>; // matmul output dtype
     using xscaleType = float;
     using rowIndexType = std::conditional_t<rowIndType == 1, int32_t, int64_t>;
     using ProblemShape = Cgmct::Gemm::MatmulShape;
@@ -80,45 +81,43 @@ __aicore__ inline void grouped_matmul_finalize_routing_pertoken_dequant(
 
     gmmParams.matmulTiling = &matmulTiling_;
 
-    // <<< ADD BEGIN: 确定性分支
     if (gmmFinalizeRoutingQuantParams_.deterministicFlag == 1) {
-        // ============ 确定性模式 ============
-        // 方案A: 将 Params 中的 y 地址重定向到 workspace 中的确定性缓冲区
-        // Cgmct Kernel 正常执行，Epilogue 的 SetAtomicAdd 写到 workspace 而非 yGm
-        // Kernel 完成后调用 FRDeterministicA5 聚合
+        // ============ Deterministic mode (W8A8 INT8 only) ============
+        // Redirect Cgmct Params y address to workspace deterministic buffer.
+        // Epilogue SetAtomicAdd writes to workspace instead of yGm.
+        // After Cgmct Kernel completes, call FRDeterministicA5 to aggregate.
 
-        // 计算确定性缓冲区偏移（在已有 workspace 之后）
-        // 参考 A3 Init 第162-166行: workspace + parallNum * baseM * baseN * sizeof(int32_t) * coreNum
+        // Compute deterministic buffer offset (after existing workspace)
         uint64_t deterBufferOffset = static_cast<uint64_t>(matmulTiling_.usedCoreNum) *
             matmulTiling_.baseM * matmulTiling_.baseN * sizeof(int32_t);
         GM_ADDR deterBuffer = workspaceGM + deterBufferOffset;
 
+        // Redirect all y addresses in Params to deterministic buffer
         Params params = {
             {1, 1, 1, 1},
-            {x, w, deterBuffer, bias, group_list},             // y → workspace 确定性缓冲区
-            {share_input, deterBuffer,                         // prologue y → workspace
+            {x, w, deterBuffer, bias, group_list},              // y -> workspace
+            {share_input, deterBuffer,                           // prologue y -> workspace
              gmmFinalizeRoutingQuantParams_.sharedInputOffset,
-             gmmFinalizeRoutingQuantParams_.sharedInputLen, matmulTiling_.N, gmmFinalizeRoutingQuantParams_.batch,
+             gmmFinalizeRoutingQuantParams_.sharedInputLen, matmulTiling_.N,
+             gmmFinalizeRoutingQuantParams_.batch,
              gmmFinalizeRoutingQuantParams_.residualScale},
-            {deterBuffer, w_scale, x_scale, bias, logit, row_index,  // epilogue y → workspace
+            {deterBuffer, w_scale, x_scale, bias, logit, row_index,  // epilogue y -> workspace
              matmulTiling_.baseM, matmulTiling_.baseN},
             gmmParams};
 
-        // 执行 Cgmct Kernel（输出到 workspace）
+        // Execute Cgmct Kernel (output to workspace)
         GmmKernel gmm;
         gmm(params);
 
-        // 执行确定性聚合：workspace → yGm
-        // 参考 A3 Process 第303-306行（SyncConfig 初始化）和第331-334行（最终调用）
+        // ============ Deterministic aggregation: workspace -> yGm ============
         GlobalTensor<float> deterBufferGm;
         deterBufferGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(deterBuffer));
         GlobalTensor<float> yGm;
         yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y));
         GlobalTensor<rowIndexType> tokenRanksGm;
         tokenRanksGm.SetGlobalBuffer(reinterpret_cast<__gm__ rowIndexType*>(row_index));
-        GlobalTensor<int64_t> groupTokensGm;
-        groupTokensGm.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(group_list));
 
+        // Init SyncConfig
         SyncConfig syncConfig;
         syncConfig.windowSize = gmmFinalizeRoutingQuantParams_.deterWorkspaceSize /
                                 (matmulTiling_.N * sizeof(float));
@@ -126,34 +125,29 @@ __aicore__ inline void grouped_matmul_finalize_routing_pertoken_dequant(
         uint64_t nTimes = Ceil(matmulTiling_.N, DETER_UB_SIZE / sizeof(float));
         syncConfig.baseN = Ceil(Ceil(matmulTiling_.N, nTimes), 128) * 128;
 
-        // 初始化 queBind（确定性 UB 中转 buffer）
-        // 参考 A3 InitUbBuffer 第186-188行
+        // Init queBind (deterministic UB transfer buffer)
         TQueBind<TPosition::VECIN, TPosition::VECOUT, 1> queBind;
         TPipe deterPipe;
         deterPipe.InitBuffer(queBind, BUFFER_NUM, DETER_UB_SIZE);
 
-        // 最终聚合
-        syncConfig.curM = matmulTiling_.M;  // 总行数
+        // Final aggregation: set curM to total rows, process all at once
+        syncConfig.curM = matmulTiling_.M;
         FRDeterministicA5<float, rowIndexType>(
             syncConfig, deterBufferGm, yGm, tokenRanksGm, queBind,
             matmulTiling_.usedCoreNum, matmulTiling_.N);
 
     } else {
-    // <<< ADD END
-
-        // ============ 非确定性模式（完全不变）============
+        // ============ Non-deterministic mode (unchanged) ============
         Params params = {
-            {1, 1, 1, 1},
-            {x, w, y, bias, group_list},
+            {1, 1, 1, 1},                // problem shape
+            {x, w, y, bias, group_list}, // BlockMmadParams
             {share_input, y, gmmFinalizeRoutingQuantParams_.sharedInputOffset,
              gmmFinalizeRoutingQuantParams_.sharedInputLen, matmulTiling_.N, gmmFinalizeRoutingQuantParams_.batch,
-             gmmFinalizeRoutingQuantParams_.residualScale},
-            {y, w_scale, x_scale, bias, logit, row_index, matmulTiling_.baseM, matmulTiling_.baseN},
+             gmmFinalizeRoutingQuantParams_.residualScale},                                          // prologue params
+            {y, w_scale, x_scale, bias, logit, row_index, matmulTiling_.baseM, matmulTiling_.baseN}, // epilogue params
             gmmParams};
         GmmKernel gmm;
         gmm(params);
-
-    // <<< ADD BEGIN
     }
-    // <<< ADD END
 }
+#endif
