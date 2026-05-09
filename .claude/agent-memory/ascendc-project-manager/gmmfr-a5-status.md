@@ -8,43 +8,42 @@ type: project
 
 **Location**: `m:\Desktop\tmp\AgentTest\AscendC\project\gmmfr_deterministic_a5\`
 **Target Platform**: A5 (Ascend 950), arch35
-**Status**: Code implemented and synced to ops-transformer_AI, but hash not deterministic (as of 2026-05-09)
+**Status**: COMPLETED -- precision verified, deterministic hash verified (2026-05-09)
 
-### Critical Finding (2026-05-09)
+### Final Implementation (Plan B: SequentialWrite Epilogue)
 
-Actual code in ops-transformer_AI diverges from plan_a_code documentation:
-- `pertoken_dequant.h` still uses original `BlockEpilogueDequantFinalizeRouting` (scatter+AtomicAdd), NOT the new `BlockEpilogueDequantSequentialWrite`
-- `BlockEpilogueDequantSequentialWrite` exists in repo but is NOT used in the deterministic branch
-- The actual approach: both Prologue and Epilogue write to `deterBuffer` (workspace+16MB), then aggregation iterates 0..batch rows and direct-writes from workspace to yGm
-- The Epilogue scatter+AtomicAdd on workspace means workspace accumulates results by outRow correctly
-- Aggregation reads `deterBufferGm[outRow * N + nOffset]` (by outRow) and writes `yGm[outRow * N + nOffset]`
+Three files modified/created:
+1. `gmm/common/cgmct/epilogue/block_epilogue_dequant_sequantial_write.h` -- NEW, sequential write epilogue
+2. `gmm/grouped_matmul_finalize_routing/op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h` -- MODIFIED, deterministic branch
+3. `gmm/grouped_matmul_finalize_routing/op_kernel/arch35/gmm_fr_deterministic_a5.h` -- NEW, A5 aggregation function
 
-### Root Cause of Non-Determinism (User Report)
-- Precision correct (error ratio 0.000000)
-- Hash changes each run (7a3886de, 669a8652, 0b2d37c2, etc.)
-- Indicates non-deterministic floating point accumulation order still exists somewhere
+### Data Flow (Deterministic Mode)
+```
+Phase 1: Prologue -> yGm (zeros + residual)
+Phase 2: Epilogue (SequentialWrite) -> workspace (dequant only, no AtomicAdd)
+Phase 3: Aggregation (FRDeterministicA5) -> yGm += workspace (AtomicAdd, single writer per outRow)
+```
 
-### Code Structure (plan_a_code/)
-- `a3_prototype/` -- A3 deterministic prototype (reference only, NOT for A5 use)
-- `op_kernel/arch35/` -- A5 Kernel side: deterministic branches, aggregation functions
-  - `gmm_fr_deterministic_a5.h` -- A5-specific deterministic aggregation (SyncAll-based)
-  - `grouped_matmul_finalize_routing_pertoken_dequant.h` -- Modified with deterministic branch
-- `op_host/op_tiling/arch35/` -- A5 Tiling side: deterministic tiling logic
+### Key Design Decisions
+- Prologue writes to yGm (NOT workspace) to avoid conflict with Epilogue
+- Epilogue uses accumulatedGroupOffset_ for absolute row addressing across groups
+- No AtomicAdd in Epilogue; AtomicAdd only in Aggregation with single-writer-per-row guarantee
+- totalM uses matmulTiling_.M (total input rows) not batch (output rows)
+- Separate GMMTilingDeterministic type needed (nested struct type incompatibility)
+
+### Verification Results
+- Precision: error ratio 0.000000
+- Determinism: hash consistent across multiple runs
 
 ### Key Documentation
-- `project_plan.md` -- Overall project plan
-- `code_analysis_optimized_plan.md` -- Optimized plan after code analysis
-- `plan_b.md` -- Alternative plan B (SequentialWrite Epilogue -- exists but unused)
-- `plan_a_code/README.md` -- Code modification guide
-- `acceptance_report.md` -- Acceptance report with known BUGs (BUG-04 fixed, BUG-05/BUG-08 need evaluation)
-- `server_verification_checklist.md` -- Server verification steps
+- `gmmfr_deterministic_a5_modification_guide.md` -- Complete technical design document (v2.0, full A3->A5 migration guide)
+  - Covers: Tiling layer, Kernel layer, aclnn layer, Cgmct framework layer
+  - Includes: design rationale, A3 vs A5 comparison, call chain tracing, code analysis with line numbers
+  - Key sections: accumulatedGroupOffset_ mechanism, GMMTiling type isolation, AIC SyncAll pairing
 
-### Known BUGs (from acceptance_report.md)
-- BUG-04: FIXED - GetWorkspaceSize() now adds deterWorkspaceSize to total
-- BUG-05: FIXED - deterBufferOffset = SYS_WORKSPACE_SIZE (16MB) instead of usedCoreNum*baseM*baseN
-- BUG-08: EVALUATED - overflow protection added in Tiling (requiredDeterSize check), auto-downgrade to non-deterministic
-- WARNING-03: RESOLVED - AIC cores now call SyncAll twice (strict pairing)
-
-### Unresolved Issues
-- SequentialWrite Epilogue exists but is NOT used -- actual code uses original AtomicAdd scatter Epilogue on workspace
-- Need to investigate why hash is still non-deterministic despite deterministic branch
+### Resolved Issues (Historical)
+- BUG-04: FIXED - GetWorkspaceSize() adds deterWorkspaceSize
+- BUG-05: FIXED - deterBufferOffset = SYS_WORKSPACE_SIZE (16MB)
+- BUG-08: FIXED - overflow protection, auto-downgrade
+- WARNING-03: RESOLVED - AIC cores call SyncAll twice
+- Prologue/Epilogue workspace conflict: FIXED - Prologue targets yGm not workspace

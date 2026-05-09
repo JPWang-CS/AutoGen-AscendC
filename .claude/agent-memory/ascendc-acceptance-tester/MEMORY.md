@@ -6,6 +6,7 @@
 - `skills/` -- accumulated testing knowledge repository
 
 ## Key Findings
+- (2026-05-09) GMMTiling type fix verified: PASS. Deterministic branch now uses GmmKernelDeterministic::GMMTiling instead of GmmKernel::GMMTiling
 - (2026-05-09) GMMFR deterministic fix verified: PASS. 3 files modified, root cause (scatter+AtomicAdd) fixed
 - (2026-05-08) GMMFR initial migration: CONDITIONAL PASS. 5 files modified, 3 critical bugs, 3 major risks found
 
@@ -22,6 +23,7 @@
 - Cgmct Epilogue scatter is root cause of non-determinism in finalize_routing
 - deterBufferOffset calculation differs between A3 and A5
 - TilingKey routing provides implicit safety net but explicit checks are better
+- **GMMTiling type mismatch**: Same class template with different Epilogue params produces DIFFERENT GMMTiling types in C++. Always use the correct kernel's own GMMTiling (e.g., `GmmKernelDeterministic::GMMTiling` for deterministic branch, NOT `GmmKernel::GMMTiling`). Fields are identical but types are incompatible.
 
 ## Testing Patterns
 - Tiling tests use CSV-driven parameterized tests (48-column CSV format)
