@@ -4,57 +4,40 @@ description: Active project status for GMMFR deterministic feature migration fro
 type: project
 ---
 
-## Current Status: In Development (Plan A code generated, Plan B designed)
+## Current Status: Sliding Window Implementation Complete
 
 - **Source Platform**: A3 (910C) / arch32
 - **Target Platform**: A5 (950) / arch35
 - **Scope**: Only W8A8 (INT8 x INT8) PerToken full quantization path
 - **Out of Scope**: FP8/FP4/HIFLOAT8, MX format, Weight Quant (pseudo-quantization)
-- **Estimated Effort**: ~5 days (2 people parallel)
 
 ## Problem
 
 GMMFR Finalize Routing uses SetAtomicAdd for multi-core result accumulation. Due to non-deterministic parallel execution order, floating-point addition is non-associative, causing small numerical differences across runs.
 
-## Solution Strategy
+## Solution: External Multi-Round Loop + Offset Passing (Plan D)
 
-Three-phase "sliding window + delayed aggregation":
-1. Cube+Vector compute normally, but write dequantized results to workspace (not yGm)
-2. When accumulated rows reach windowSize, trigger FRDeterministic
-3. FRDeterministic: SyncAll -> assign row ownership by outRow % coreNumVec -> SetAtomicAdd to yGm -> SyncAll
+Sliding window with group-boundary alignment. Workspace reused across rounds. Never degrades.
 
-## Two Plans
+### Architecture
+1. Tiling: compute windowSize = workspaceSize / (N * sizeof(float)), never degrade
+2. Outer while loop: group groups into rounds that fit within windowSize
+3. Each round: new Cgmct Kernel instance with offset inputs + preOffsetInit
+4. Each round: FRDeterministicA5 aggregates workspace -> yGm with globalRowOffset
 
-### Plan A (Modify existing Epilogue)
-- 8 files (6 modified + 1 new + 1 test)
-- Adds deterministic branch inside existing BlockEpilogueDequantFinalizeRouting
-- Medium regression risk (modifies shared Cgmct code)
+### Files Modified (5 files)
 
-### Plan B (New Epilogue, preferred)
-- 6 files (4 modified + 2 new)
-- Creates new BlockEpilogueDequantOnly Epilogue class (INT8 only)
-- Zero regression risk for non-deterministic path (doesn't touch existing Epilogue)
-- Key insight: Epilogue is a template parameter in Cgmct, so it can be swapped
+1. `op_kernel/arch35/grouped_matmul_finalize_routing_tiling_data.h` -- added windowSize, totalM
+2. `op_host/op_tiling/arch35/grouped_matmul_finalize_routing_quant_tiling.cpp` -- replaced degradation with windowSize calc
+3. `common/cgmct/kernel/kernel_gmm_finalize_routing_pertoken_dequant.h` -- added preOffsetInit to GMMTiling
+4. `op_kernel/arch35/gmm_fr_deterministic_a5.h` -- added globalRowOffset param
+5. `op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h` -- sliding window multi-round loop
 
-## Files to Modify (Plan B)
-
-### New files:
-- `op_kernel/arch35/block_epilogue_dequant_only.h` -- New Epilogue for INT8 dequant only
-- `op_kernel/arch35/gmm_fr_deterministic_a5.h` -- A5 deterministic aggregation function
-
-### Modified files:
-- `op_kernel/arch35/grouped_matmul_finalize_routing_tiling_data.h` -- Add deterministicFlag + deterWorkspaceSize
-- `op_host/op_tiling/arch35/grouped_matmul_finalize_routing_quant_tiling.h` -- Declare deterministic members
-- `op_host/op_tiling/arch35/grouped_matmul_finalize_routing_quant_tiling.cpp` -- Implement deterministic tiling
-- `op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h` -- Add if/else deterministic branch
-
-## Key Data Types (INT8 path only)
-
-```
-Input: x=INT8, weight=INT8(FRACTAL_NZ), scale=FLOAT/BF16, pertoken_scale=FLOAT, bias=BF16
-Intermediate: Cube output = INT32 (INT8 x INT8)
-Output: y=FP32 (INT32 -> dequant -> FP32)
-```
+### Key Design Decisions
+- GMMTiling preOffsetInit: for cumulative groupListType=0, preOffset_ must be initialized to the accumulated value of skipped groups
+- Prologue batch=0 for subsequent rounds: Prologue initOutput zeros 0 rows, effectively a no-op
+- Epilogue SequentialWrite writes from workspace row 0 each round (accumulatedGroupOffset_ resets per kernel instance)
+- NZ weight offset: CeilDiv(n, 32) * CeilDiv(k, 16) * 512 per group (non-transposed)
 
 ## Acceptance Criteria
 

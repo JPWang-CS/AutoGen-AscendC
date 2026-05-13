@@ -6,9 +6,21 @@
 - `skills/` -- accumulated testing knowledge repository
 
 ## Key Findings
+- (2026-05-11) Sliding window full implementation re-verification: **PASS**. 5 files modified (tiling_data.h, tiling.cpp, kernel framework, deterministic_a5.h, pertoken_dequant.h). All 5 check items passed. ISSUE-2 (单group溢出) retained as MEDIUM risk.
+- (2026-05-11) Sliding window ISSUE-1 fix re-test: **PASS**. prologueSharedInputOffset/PrologueSharedInputLen/prologueBatch 三个参数后续轮正确清零，Prologue空跑不破坏yGm
+- (2026-05-11) Sliding window implementation: initial **FAIL**, ISSUE-1 fixed and re-verified PASS. 1 MEDIUM risk remaining (ISSUE-2: 单group溢出)
+- (2026-05-11) DETER_UB_SIZE 12KB->8KB verified: PASS. UB margin improved from ~25KB to ~33KB, no performance impact for N<=4096
 - (2026-05-09) GMMTiling type fix verified: PASS. Deterministic branch now uses GmmKernelDeterministic::GMMTiling instead of GmmKernel::GMMTiling
 - (2026-05-09) GMMFR deterministic fix verified: PASS. 3 files modified, root cause (scatter+AtomicAdd) fixed
 - (2026-05-08) GMMFR initial migration: CONDITIONAL PASS. 5 files modified, 3 critical bugs, 3 major risks found
+
+## A5 UB Budget Analysis (248KB total)
+- SequentialWrite Epilogue: ~199KB (VECIN + VECOUT, max offset at ~199KB)
+- Prologue: ~136KB (VECCALC + VECIN, time-multiplexed with Epilogue, shares same UB)
+- FRDeterministicA5 queBind: 16KB (2 buffers * 8KB)
+- **Active total**: ~215KB (33KB margin)
+- Prologue and Epilogue are time-multiplexed -- they share the same UB space, not additive
+- Only 4 files in the entire project reference DETER_UB_SIZE (2 arch35, 2 arch32)
 
 ## GMMFR Deterministic Fix (2026-05-09) -- VERIFIED PASS
 - Root cause: Epilogue scatter+AtomicAdd caused non-deterministic float accumulation order
@@ -24,6 +36,15 @@
 - deterBufferOffset calculation differs between A3 and A5
 - TilingKey routing provides implicit safety net but explicit checks are better
 - **GMMTiling type mismatch**: Same class template with different Epilogue params produces DIFFERENT GMMTiling types in C++. Always use the correct kernel's own GMMTiling (e.g., `GmmKernelDeterministic::GMMTiling` for deterministic branch, NOT `GmmKernel::GMMTiling`). Fields are identical but types are incompatible.
+- **Prologue skip pitfall**: When passing batch=0 to skip Prologue in multi-round, MUST also set sharedInputOffset=0 and sharedInputLen=0. Otherwise Prologue clears yGm data and unsigned underflow in `n*(0-tail)`. Prologue code has no batch==0 guard -- it checks sharedInputLen first.
+
+## Sliding Window Design Pattern (A5 GMMFR)
+- Window boundaries align to group boundaries (not within groups, unlike A3)
+- Each round: new Kernel instance + FRDeterministicA5 aggregation
+- workspace reused each round (written from row 0, safe after SyncAll #3)
+- Prologue only runs in round 1 (batch>0); round 2+ must use batch=0 AND sharedInputLen=0
+- SyncAll per round: 3 (1 Kernel + 2 FRDeterministicA5), AIC+AIV strictly paired
+- Single group exceeding windowSize causes workspace overflow (no runtime check)
 
 ## Testing Patterns
 - Tiling tests use CSV-driven parameterized tests (48-column CSV format)
