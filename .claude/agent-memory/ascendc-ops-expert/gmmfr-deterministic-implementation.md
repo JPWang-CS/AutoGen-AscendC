@@ -49,9 +49,18 @@ in `baseOffset_`, which accumulates across groups via `UpdateOffset()`.
 | `common/cgmct/epilogue/block_epilogue_dequant_sequential_write.h` | VectorSequentialWrite: use abs mOffset addressing, no AtomicAdd; add accumulatedGroupOffset_ member |
 | `op_kernel/arch35/grouped_matmul_finalize_routing_pertoken_dequant.h` | Det branch: use GmmKernelDeterministic with SequentialWrite epilogue; Prologue -> yGm; call FRDeterministicA5 |
 | `op_kernel/arch35/gmm_fr_deterministic_a5.h` | Updated docs; logic unchanged (already correct for mOffset workspace layout) |
+| `common/cgmct/kernel/kernel_gmm_fr_deterministic.h` | Tile-level AIV-only cycling kernel (replaces A3 VectorSync group-level cycling) |
+| `common/cgmct/epilogue/block_epilogue_dequant_sequential_write_deterministic.h` | Cycling-aware epilogue (separate from non-deterministic version) |
 
 ### SyncAll Count
 
 - Deterministic: Cgmct kernel 1 + FRDeterministicA5 2 = 3 SyncAll per core
 - Non-deterministic: Cgmct kernel 1 = 1 SyncAll per core
 - Both correctly paired (all cores take same branch based on shared tiling data)
+
+### Known Open Issues (2026-05-19 review)
+
+1. **CRITICAL**: Epilogue wsWriteOffset includes logitBase (group-inner global offset), but aggregation reads from row 0. Need cycling-window-relative addressing.
+2. **CRITICAL**: SubBlock duplicate execution in aggregation (both inline cycling and FRDeterministicA5). GetBlockIdx() is same for both subBlocks -> each row aggregated twice.
+3. **CRITICAL**: After cycling reset, Epilogue skips workspaceBaseRow=0 rows, writes at groupInnerMOffset instead.
+4. **MINOR**: printf debug statements in gmm_fr_deterministic_a5.h need cleanup.
